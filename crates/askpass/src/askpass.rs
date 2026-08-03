@@ -479,8 +479,20 @@ fn generate_gpg_wrapper_script(
     askpass_program: &std::path::Path,
     askpass_socket: &std::path::Path,
 ) -> Result<String> {
-    let shell_kind = ShellKind::Posix;
     let gpg_program = find_gpg_program().context("could not find a gpg binary on PATH")?;
+    generate_gpg_wrapper_script_with_gpg(askpass_program, askpass_socket, &gpg_program)
+}
+
+/// Builds the gpg wrapper body for a known `gpg` binary path.
+///
+/// Separated from binary discovery so unit tests can run without `gpg` on PATH.
+#[cfg(not(target_os = "windows"))]
+fn generate_gpg_wrapper_script_with_gpg(
+    askpass_program: &std::path::Path,
+    askpass_socket: &std::path::Path,
+    gpg_program: &std::path::Path,
+) -> Result<String> {
+    let shell_kind = ShellKind::Posix;
     let gpg_program = gpg_program
         .to_str()
         .context("gpg program is on a non-utf8 path")?;
@@ -505,15 +517,23 @@ fn generate_gpg_wrapper_script(
         .context("Failed to shell-escape gpg passphrase prompt")?;
 
     // The wrapper only intervenes when git asks gpg to *sign* (e.g. `gpg -bsau
-    // <key>`); other invocations like `--verify` run unchanged. For signing we
-    // first try plain gpg so gpg-agent/keychain can supply a cached or empty
-    // passphrase silently, and only fall back to asking Zed (loopback mode, fd
-    // 3) when that fails, e.g. the "Inappropriate ioctl for device" case with no
-    // TTY for pinentry.
+    // <key>`); other invocations like `--verify` run unchanged.
+    //
+    // For signing we try, in order:
+    // 1. `--pinentry-mode error` — succeeds when gpg-agent already has the
+    //    passphrase in memory or the key is unprotected, without launching
+    //    pinentry.
+    // 2. Default pinentry — lets GUI pinentry / Keychain supply the passphrase
+    //    (e.g. pinentry-mac "Save in Keychain"). We must not skip this: using
+    //    only step 1 caused Zed to prompt on every commit for Keychain-backed
+    //    setups, because `--pinentry-mode error` never launches pinentry and so
+    //    never hits Keychain (see #61766 / #61806).
+    // 3. Zed askpass + loopback — for TTY-only pinentry that fails with
+    //    "Inappropriate ioctl for device" when git runs without a TTY.
     //
     // git streams the payload on stdin (readable once) and reads the signature
-    // from stdout, so we buffer stdin to replay it into both attempts and buffer
-    // the first attempt's output, forwarding it only if it succeeds. The
+    // from stdout, so we buffer stdin to replay it into each attempt and buffer
+    // each attempt's output, forwarding it only if it succeeds. The loopback
     // passphrase goes to fd 3 via a pipe.
     Ok(format!(
         r#"#!/bin/sh
@@ -533,8 +553,8 @@ if [ -z "${{is_signing}}" ]; then
     exec {gpg_program} "$@"
 fi
 
-# Signing. Buffer stdin (the payload) and the first attempt's output
-# so we can retry cleanly on failure without git seeing partial output.
+# Signing. Buffer stdin (the payload) and attempt outputs so we can retry
+# cleanly on failure without git seeing partial output.
 tmpdir=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmpdir"' EXIT
 payload="$tmpdir/payload"
@@ -542,17 +562,21 @@ signature="$tmpdir/signature"
 status="$tmpdir/status"
 cat > "$payload" || exit 1
 
-# First try letting gpg-agent/keychain supply the passphrase without any
-# interactive pinentry. If that succeeds (cached passphrase)
-# forward its output and we're done, so Zed never shows a modal.
+# 1) Agent memory cache / unprotected key — no pinentry.
 if {gpg_program} --pinentry-mode error "$@" < "$payload" > "$signature" 2> "$status"; then
     cat "$status" >&2
     cat "$signature"
     exit 0
 fi
 
-# The silent attempt failed: ask Zed for the passphrase, then hand it to gpg on
-# fd 3 using loopback mode so no pinentry/terminal is required.
+# 2) Default pinentry path (Keychain, GUI pinentry, etc.). Matches terminal git.
+if {gpg_program} "$@" < "$payload" > "$signature" 2> "$status"; then
+    cat "$status" >&2
+    cat "$signature"
+    exit 0
+fi
+
+# 3) TTY pinentry failed or passphrase still unavailable: ask Zed, then loopback.
 passphrase=$(printf '%s\0' {prompt} | {askpass_program} --askpass={askpass_socket} 2>/dev/null)
 printf '%s\n' "$passphrase" |
 {gpg_program} --pinentry-mode loopback --passphrase-fd 3 "$@" 3<&0 < "$payload"
@@ -567,4 +591,84 @@ fn find_gpg_program() -> Option<std::path::PathBuf> {
     ["gpg", "gpg2"]
         .into_iter()
         .find_map(|candidate| which::which(candidate).ok())
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn gpg_wrapper_tries_default_pinentry_before_zed_loopback() {
+        let script = generate_gpg_wrapper_script_with_gpg(
+            Path::new("/Applications/Zed.app/Contents/MacOS/zed"),
+            Path::new("/tmp/zed-askpass.sock"),
+            Path::new("/usr/bin/gpg"),
+        )
+        .expect("wrapper script should generate");
+
+        // Signing-only intervention.
+        assert!(
+            script.contains("is_signing=1"),
+            "wrapper should detect signing flags"
+        );
+
+        // Fast path for agent-cached / unprotected keys.
+        assert!(
+            script.contains("--pinentry-mode error"),
+            "wrapper should try pinentry-mode error first for agent cache"
+        );
+
+        // Critical fix: a default-pinentry attempt must exist so Keychain /
+        // GUI pinentry can supply the passphrase before Zed prompts.
+        let error_mode_idx = script
+            .find("--pinentry-mode error")
+            .expect("missing pinentry-mode error attempt");
+        let loopback_idx = script
+            .find("--pinentry-mode loopback")
+            .expect("missing loopback fallback");
+        // Between error-mode and loopback there must be a plain gpg invocation
+        // (no pinentry-mode flag on that line). Match the second signing try.
+        let between = &script[error_mode_idx..loopback_idx];
+        assert!(
+            between.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.contains("/usr/bin/gpg")
+                    && trimmed.contains("\"$@\"")
+                    && !trimmed.contains("--pinentry-mode")
+            }),
+            "wrapper must try default pinentry (plain gpg) before Zed loopback;\n\
+             this is required for Keychain-backed pinentry-mac and similar setups.\n\
+             segment between error-mode and loopback:\n{between}"
+        );
+
+        // Zed askpass fallback still present for TTY pinentry / ioctl failures.
+        assert!(
+            script.contains("--askpass="),
+            "wrapper should fall back to Zed askpass"
+        );
+        assert!(
+            script.contains("--pinentry-mode loopback"),
+            "wrapper should fall back to loopback with passphrase-fd"
+        );
+        assert!(
+            script.contains("Enter passphrase for your Git signing key:"),
+            "wrapper should use the Zed signing passphrase prompt"
+        );
+    }
+
+    #[test]
+    fn gpg_wrapper_leaves_non_signing_invocations_alone() {
+        let script = generate_gpg_wrapper_script_with_gpg(
+            Path::new("/zed"),
+            Path::new("/tmp/sock"),
+            Path::new("/usr/bin/gpg"),
+        )
+        .expect("wrapper script should generate");
+
+        assert!(
+            script.contains("exec /usr/bin/gpg \"$@\""),
+            "non-signing gpg invocations should exec through unchanged"
+        );
+    }
 }
